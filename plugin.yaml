@@ -1,0 +1,14 @@
+name: hermes-gdrive-pane
+label: Drive pane
+version: 0.1.0
+author: Robert Ung
+description: >
+  Google Drive as a dockable pane in Hermes Desktop: browse folders, search
+  files, inspect a file's metadata, open it in Drive, copy a link, or hand the
+  file to the agent in a new chat after picking a Hermes profile. Read-only in
+  the pane; downloads and moves go through the agent (gog-robert / rclone). The
+  Python half reads the active profile's google_token.json, so no token is ever
+  baked into the source.
+requires_hermes: ">=0.21"
+provides_tools: []
+provides_hooks: []
