@@ -9,15 +9,20 @@ Google Drive as a pane inside the Hermes Desktop app (Linux/macOS).
 - Full-text search (`name contains` / `fullText contains`) over the account.
 - File metadata: kind, size, modified, owner, parents, sharing state, link.
 - Open in Google Drive, or hand the item to the agent.
+- **Save a copy** of a file to a path you pick in the native save dialog. Google
+  Docs and Slides export to PDF, Sheets to xlsx; everything else is downloaded
+  raw. The download streams to a `.part` file and lands with an atomic rename, so
+  a dropped connection cannot leave a half-written file at your path.
+- **Upload** one file (up to 512 MB) into the folder on screen.
 - **Ask agent**, routed to the chat in front of you or to a fresh chat in any
   Hermes profile. The handoff carries the file id, MIME type, path and the exact
   `gog-robert drive download` / `drive search` command to use — including the
   "Docs export to PDF, the saved file has no extension" trap that otherwise
   wastes a turn.
 
-Read-only. Nothing is downloaded, moved, renamed, trashed or shared from the
-pane; the agent does that with `gog-robert` (or the rclone mount at
-`~/GoogleDrive`).
+Moves, renames, trashing and sharing are deliberately not in the pane; the agent
+does those with `gog-robert` (or the rclone mount at `~/GoogleDrive`). An upload
+is verified by reading the new file back (id, parent, name).
 
 ## Install
 

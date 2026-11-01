@@ -28,7 +28,9 @@ import {
   SegmentedControl,
   Separator,
   StatusDot,
+  useMutation,
   useQuery,
+  useQueryClient,
   useValue
 } from '@hermes/plugin-sdk'
 import { useState } from 'react'
@@ -495,6 +497,10 @@ function FileRow({ file, onOpen }) {
   )
 }
 
+function currentName(trail) {
+  return trail.length ? trail[trail.length - 1].name : 'My Drive'
+}
+
 function Breadcrumbs({ onJump, trail }) {
   return jsxs('div', {
     className: 'flex flex-wrap items-center gap-0.5 px-1 pb-1 text-[0.65rem] text-(--ui-text-quaternary)',
@@ -548,8 +554,21 @@ function DetailLine({ children, label }) {
 }
 
 function FileDetail({ ctx, fileId, onAsk, onBack, onOpenFolder }) {
+  const qc = useQueryClient()
   const detailQ = useFileDetail(ctx, fileId)
   const file = detailQ.data && detailQ.data.file
+
+  const save = useMutation({
+    mutationFn: payload => ctx.rest('/download', { body: payload, method: 'POST' }),
+    onError: error => host.notify({ kind: 'error', message: errorText(error) }),
+    onSuccess: data => {
+      host.notify({
+        kind: 'success',
+        message: `Saved ${data.name} (${humanSize(data.bytes)}) to ${data.path.split('/').slice(-2).join('/')}`
+      })
+      Promise.resolve(ctx.os.revealPath(data.path)).catch(() => {})
+    }
+  })
 
   if (detailQ.isLoading) {
     return jsx('div', {
@@ -581,6 +600,21 @@ function FileDetail({ ctx, fileId, onAsk, onBack, onOpenFolder }) {
         host.notify({ kind: 'warning', message: 'Could not open the browser' })
       }
     })
+  }
+
+  const saveCopy = async () => {
+    // The native dialog hands back a path on the BACKEND's filesystem, which is
+    // exactly what the download route writes to.
+    const picked = await ctx.os.pickSavePath({
+      defaultPath: file.name,
+      title: `Save ${file.name}`
+    })
+
+    if (!picked) {
+      return
+    }
+
+    save.mutate({ fileId: file.id, targetPath: picked })
   }
 
   return jsxs('div', {
@@ -685,14 +719,24 @@ function FileDetail({ ctx, fileId, onAsk, onBack, onOpenFolder }) {
                 variant: 'ghost',
                 children: 'Browse folder'
               })
-            : null
+            : jsx(Button, {
+                disabled: save.isPending,
+                onClick: saveCopy,
+                size: 'xs',
+                type: 'button',
+                variant: 'outline',
+                children: save.isPending ? 'Saving…' : 'Save a copy'
+              })
         ]
       }),
+      save.error
+        ? jsx('div', { className: 'px-1 text-[0.65rem] leading-4 text-destructive', children: errorText(save.error) })
+        : null,
       jsx('div', {
         className: 'px-1 pt-2 text-[0.6rem] leading-4 text-(--ui-text-quaternary)',
         children: file.isFolder
-          ? 'Folders are listings only — nothing is downloaded until the agent is asked to.'
-          : 'The pane never downloads: hand the file to the agent, which fetches a copy with gog-robert.'
+          ? 'Folders are listings only — a folder is never downloaded.'
+          : 'Save a copy writes to a path you pick. Moves, renames and sharing stay with the agent.'
       })
     ]
   })
@@ -703,6 +747,7 @@ function FileDetail({ ctx, fileId, onAsk, onBack, onOpenFolder }) {
 /* ------------------------------------------------------------------ */
 
 function DrivePane({ ctx }) {
+  const qc = useQueryClient()
   const [trail, setTrail] = useState([])
   const [scope, setScope] = useState('browse')
   const [draft, setDraft] = useState('')
@@ -713,6 +758,25 @@ function DrivePane({ ctx }) {
   const statusQ = useStatus(ctx)
 
   const current = trail.length ? trail[trail.length - 1].id : ''
+
+  const upload = useMutation({
+    mutationFn: payload => ctx.rest('/upload', { body: payload, method: 'POST' }),
+    onError: error => host.notify({ kind: 'error', message: errorText(error) }),
+    onSuccess: data => {
+      qc.invalidateQueries({ queryKey: [ID] })
+      host.notify({ kind: 'success', message: `Uploaded ${data.name} (${humanSize(data.bytes)})` })
+    }
+  })
+
+  const uploadHere = async () => {
+    const picked = await ctx.os.pickOpenPath({ title: `Upload into ${currentName(trail)}` })
+
+    if (!picked) {
+      return
+    }
+
+    upload.mutate({ folderId: current, path: picked })
+  }
   const filesQ = useFiles(
     ctx,
     { folderId: current, scope: search ? 'search' : scope, search },
@@ -787,6 +851,17 @@ function DrivePane({ ctx }) {
             className: 'min-w-0 flex-1 truncate text-[0.65rem] text-(--ui-text-quaternary)',
             children: statusQ.data ? statusQ.data.account || 'Drive' : statusQ.isLoading ? 'Connecting…' : 'Drive'
           }),
+          !search && scope === 'browse'
+            ? jsx(Button, {
+                disabled: upload.isPending,
+                onClick: uploadHere,
+                size: 'xs',
+                title: `Upload a file into ${currentName(trail)}`,
+                type: 'button',
+                variant: 'ghost',
+                children: jsx(Codicon, { name: upload.isPending ? 'loading' : 'cloud-upload', size: '0.85rem' })
+              })
+            : null,
           jsx(Button, {
             onClick: refresh,
             size: 'xs',

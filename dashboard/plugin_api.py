@@ -4,24 +4,48 @@ Profile-scoped: the Hermes home is resolved per call and that profile's own
 ``google_token.json`` is used (the same grant the Gmail pane reads). Refreshed
 access tokens stay in memory; the token file is never rewritten here.
 
-Reads only — listing a folder, searching, and one file's metadata. Downloads,
-moves, renames and shares go through the agent (``gog-robert drive …``) or the
-rclone mount, which is where the "don't touch what I didn't ask for" rule lives.
+Reads: listing a folder, searching, and one file's metadata. Two writes exist on
+purpose and only two — saving a copy of a file to a path the user picked in the
+native dialog, and uploading one file into the folder on screen. Nothing here
+moves, renames, trashes or shares anything; those stay with the agent
+(``gog-robert drive …``) or the rclone mount.
+
+Google-native files (Docs/Sheets/Slides) are exported on download: Docs and
+Slides as PDF, Sheets as xlsx. Downloads stream to disk in chunks and land
+through a temp file, so a large file cannot be half-written at the target path.
 """
 
 from __future__ import annotations
 
+import mimetypes
+import os
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel, Field
 
 router = APIRouter()
 
 _MAX_PAGE = 200
+_MAX_UPLOAD_BYTES = 512 * 1024 * 1024
 _FOLDER_MIME = "application/vnd.google-apps.folder"
+_GOOGLE_PREFIX = "application/vnd.google-apps."
+_EXPORT_TYPES = {
+    "application/vnd.google-apps.document": (
+        "application/pdf",
+        ".pdf",
+    ),
+    "application/vnd.google-apps.spreadsheet": (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        ".xlsx",
+    ),
+    "application/vnd.google-apps.presentation": ("application/pdf", ".pdf"),
+    "application/vnd.google-apps.drawing": ("application/pdf", ".pdf"),
+}
 
 _lock = threading.Lock()
 _local = threading.local()
@@ -115,25 +139,41 @@ def _execute(request: Any) -> dict[str, Any]:
     return result
 
 
-def _provider_error(*, auth: bool = False) -> HTTPException:
+def _provider_error(*, auth: bool = False, wrote: bool = False) -> HTTPException:
     _drop_service()
     if auth:
         return HTTPException(
             status_code=401,
             detail="Google Drive is not authorised for this Hermes profile.",
         )
+    if wrote:
+        return HTTPException(
+            status_code=502,
+            detail="The transfer may have partly completed. Check the file before retrying.",
+        )
     return HTTPException(status_code=502, detail="Google Drive is unavailable.")
 
 
-def _guard(fn: Any) -> Any:
+def _guard(fn: Any, *, write: bool = False) -> Any:
     try:
         return fn()
     except HTTPException:
         raise
     except AuthUnavailable:
         raise _provider_error(auth=True) from None
-    except Exception:
-        raise _provider_error() from None
+    except Exception as error:  # noqa: BLE001 - provider errors are opaque
+        status = getattr(getattr(error, "resp", None), "status", None)
+        if status in {400, 401, 403, 404, 409}:
+            detail = {
+                400: "Google rejected the request.",
+                401: "The Google grant no longer authorises this profile.",
+                403: "This file does not allow that operation.",
+                404: "That file or folder no longer exists.",
+                409: "Google reports a conflict on that file.",
+            }[status]
+            _drop_service()
+            raise HTTPException(status_code=status, detail=detail) from None
+        raise _provider_error(wrote=write) from None
 
 
 # --------------------------------------------------------------------------- #
@@ -323,3 +363,173 @@ def file_detail(
         return {"ok": True, "file": row, "fetchedAt": datetime.now(timezone.utc).isoformat()}
 
     return _guard(run)
+
+
+# --------------------------------------------------------------------------- #
+# local file transfer — the pane's only writes
+# --------------------------------------------------------------------------- #
+
+
+class DownloadRequest(BaseModel):
+    fileId: str = Field(min_length=1, max_length=256)
+    targetPath: str = Field(min_length=1, max_length=4096)
+
+
+class UploadRequest(BaseModel):
+    folderId: str = Field(default="", max_length=256)
+    path: str = Field(min_length=1, max_length=4096)
+    name: str = Field(default="", max_length=400)
+
+
+@dataclass(frozen=True)
+class _Target:
+    path: Path
+    replaced: bool
+
+
+def _resolve_target(raw: str, suggested_name: str) -> _Target:
+    """A destination the user picked. Absolute, parent must exist, never a directory."""
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise HTTPException(status_code=422, detail="targetPath must be absolute.")
+    resolved = candidate.resolve(strict=False)
+    if resolved.is_dir():
+        resolved = (resolved / suggested_name).resolve(strict=False)
+    parent = resolved.parent
+    if not parent.is_dir():
+        raise HTTPException(status_code=422, detail=f"The folder {parent} does not exist.")
+    if resolved.is_dir():
+        raise HTTPException(status_code=422, detail="targetPath points at a directory.")
+    return _Target(path=resolved, replaced=resolved.exists())
+
+
+def _safe_filename(name: str, fallback: str) -> str:
+    cleaned = "".join(ch for ch in (name or "").replace("/", "-") if ch not in "\\\0").strip()
+    cleaned = cleaned[:180] or fallback
+    return cleaned
+
+
+def _download_bytes(service: Any, file_id: str, mime: str) -> tuple[Any, str]:
+    """Return (media request, extension) for a Drive id."""
+    if mime.startswith(_GOOGLE_PREFIX):
+        export = _EXPORT_TYPES.get(mime)
+        if export is None:
+            export = ("application/pdf", ".pdf")
+        target_mime, extension = export
+        return service.files().export_media(fileId=file_id, mimeType=target_mime), extension
+    return service.files().get_media(fileId=file_id, supportsAllDrives=True), ""
+
+
+@router.post("/download")
+def download(request: Request, body: DownloadRequest) -> dict[str, Any]:
+    """Save one Drive file to a path the user chose in the native save dialog."""
+
+    def run() -> dict[str, Any]:
+        from googleapiclient.http import MediaIoBaseDownload
+
+        service = _service()
+        meta = _execute(
+            service.files().get(
+                fileId=body.fileId,
+                fields="id,name,mimeType,size",
+                supportsAllDrives=True,
+            )
+        )
+        mime = _text(meta.get("mimeType"), 200)
+        if mime == _FOLDER_MIME:
+            raise HTTPException(status_code=422, detail="That is a folder, not a file.")
+        name = _safe_filename(_text(meta.get("name"), 400), "drive-file")
+        media_request, extension = _download_bytes(service, body.fileId, mime)
+
+        suggested = f"{name}{extension}" if extension and not name.lower().endswith(extension) else name
+        target = _resolve_target(body.targetPath, suggested)
+
+        temp = target.path.with_name(f".{target.path.name}.part")
+        handle = temp.open("wb")
+        try:
+            downloader = MediaIoBaseDownload(handle, media_request, chunksize=4 * 1024 * 1024)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+        finally:
+            handle.close()
+
+        if not temp.is_file() or temp.stat().st_size == 0:
+            temp.unlink(missing_ok=True)
+            raise ValueError("download produced no bytes")
+        os.replace(temp, target.path)
+
+        written = target.path.stat().st_size
+        if written <= 0:
+            raise ValueError("saved file is empty")
+        return {
+            "ok": True,
+            "action": "downloaded",
+            "fileId": body.fileId,
+            "name": name,
+            "path": str(target.path),
+            "bytes": written,
+            "exported": bool(extension),
+            "replaced": target.replaced,
+            "mimeType": mime,
+        }
+
+    return _guard(write=True, fn=run)
+
+
+@router.post("/upload")
+def upload(request: Request, body: UploadRequest) -> dict[str, Any]:
+    """Put one local file into the folder on screen."""
+
+    def run() -> dict[str, Any]:
+        from googleapiclient.http import MediaFileUpload
+
+        service = _service()
+        local = Path(body.path).expanduser()
+        if not local.is_absolute():
+            raise HTTPException(status_code=422, detail="path must be absolute.")
+        if not local.is_file():
+            raise HTTPException(status_code=422, detail="That path is not a file.")
+        size = local.stat().st_size
+        if size > _MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"{local.name} is {size // (1024 * 1024)} MB — over the 512 MB pane limit.",
+            )
+
+        root = _execute(service.files().get(fileId="root", fields="id"))
+        parent = body.folderId or (_text(root.get("id"), 256) or "root")
+        name = _safe_filename(body.name or local.name, "upload")
+        mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
+
+        created = _execute(
+            service.files().create(
+                body={"name": name, "parents": [parent]},
+                media_body=MediaFileUpload(str(local), mimetype=mime, resumable=False),
+                fields="id,name,size,mimeType,webViewLink",
+                supportsAllDrives=True,
+            )
+        )
+        file_id = _text(created.get("id"), 256)
+        if not file_id:
+            raise ValueError("no file id returned")
+
+        stored = _execute(
+            service.files().get(
+                fileId=file_id, fields="id,name,size,parents,webViewLink", supportsAllDrives=True
+            )
+        )
+        if _text(stored.get("id"), 256) != file_id or parent not in (stored.get("parents") or []):
+            raise ValueError("upload readback mismatch")
+
+        return {
+            "ok": True,
+            "action": "uploaded",
+            "fileId": file_id,
+            "name": _text(stored.get("name"), 400),
+            "bytes": _int(stored.get("size")) or size,
+            "folderId": parent,
+            "webViewLink": _text(stored.get("webViewLink"), 900),
+        }
+
+    return _guard(write=True, fn=run)
