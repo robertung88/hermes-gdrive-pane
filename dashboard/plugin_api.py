@@ -72,13 +72,48 @@ def _current_home() -> str:
     return str(Path(get_hermes_home()).expanduser().resolve(strict=False))
 
 
-def _token_path() -> Path:
-    return Path(_current_home()) / "google_token.json"
+def _token_paths() -> list[Path]:
+    """Where a Google grant may live, most specific first.
+
+    The profile's own token wins, so a profile can deliberately point at another
+    account. The shared desktop store is the fallback: this pane is a desktop
+    surface shared by every profile, so a profile that was never granted a token
+    must still show real data instead of an empty pane.
+    """
+    candidates = [Path(_current_home()) / "google_token.json"]
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        root = Path(get_default_hermes_root(home=_current_home()))
+    except Exception:
+        root = Path.home() / ".hermes"
+    shared = root / "desktop-google" / "google_token.json"
+    if shared not in candidates:
+        candidates.append(shared)
+    return candidates
+
+
+def _resolved_token() -> tuple[Path, str] | None:
+    for index, path in enumerate(_token_paths()):
+        try:
+            if path.is_file():
+                return path, ("profile" if index == 0 else "shared")
+        except OSError:
+            continue
+    return None
+
+
+def _credential_source() -> str:
+    resolved = _resolved_token()
+    return resolved[1] if resolved else "missing"
 
 
 def _stamp() -> str:
+    resolved = _resolved_token()
+    if resolved is None:
+        return ""
     try:
-        return str(int(_token_path().stat().st_mtime))
+        return f"{resolved[0]}:{int(resolved[0].stat().st_mtime)}"
     except OSError:
         return ""
 
@@ -87,9 +122,11 @@ def _load_credentials() -> Any:
     from google.auth.transport.requests import Request as GoogleAuthRequest
     from google.oauth2.credentials import Credentials
 
-    path = _token_path()
-    if not path.is_file():
+    resolved = _resolved_token()
+    if resolved is None:
         raise AuthUnavailable("missing google_token.json")
+    path, _source = resolved
+    # Deliberately omit scopes: keep exactly the grants the setup script stored.
     credentials = Credentials.from_authorized_user_file(str(path))
     if credentials.expired and credentials.refresh_token:
         credentials.refresh(GoogleAuthRequest())
@@ -242,6 +279,7 @@ def status(request: Request) -> dict[str, Any]:
         return {
             "ok": True,
             "account": _text(user.get("emailAddress"), 320),
+            "credential": _credential_source(),
             "displayName": _text(user.get("displayName"), 200),
             "rootId": _text(root.get("id"), 256) or "root",
             "quota": {"limit": _int(quota.get("limit")), "usage": _int(quota.get("usage"))},

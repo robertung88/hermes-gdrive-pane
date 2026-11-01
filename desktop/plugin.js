@@ -784,6 +784,9 @@ function DrivePane({ ctx }) {
   )
 
   const auth = statusQ.error && /401|authoris|authoriz/i.test(String(statusQ.error.message || ''))
+  // 404 = this profile never enabled the pane's Python half, which is a
+  // configuration fact, not a broken connection. Say that, with the exact fix.
+  const notEnabled = statusQ.error && /\b404\b/.test(String(statusQ.error.message || ''))
   const offline = gateway !== 'open'
 
   const openFile = file => {
@@ -816,6 +819,32 @@ function DrivePane({ ctx }) {
         className: 'min-h-32',
         description: 'The gateway socket is closed. It reconnects on its own — this pane follows.',
         title: 'Reconnecting to Hermes'
+      })
+    })
+  }
+
+  if (notEnabled) {
+    return jsx('div', {
+      className: 'p-2',
+      children: jsx(ErrorState, {
+        description: jsxs('span', {
+          className: 'flex flex-col gap-1',
+          children: [
+            jsx('span', {
+              children: 'This Hermes profile has not enabled the Drive backend, so the pane has nothing to call. Enable it once for this profile:'
+            }),
+            jsx('code', { className: 'text-[0.65rem]', children: 'hermes -p <profile> plugins enable hermes-gdrive-pane' })
+          ]
+        }),
+        title: 'Drive backend not enabled in this profile',
+        children: jsx(Button, {
+          className: 'mt-2',
+          onClick: refresh,
+          size: 'xs',
+          type: 'button',
+          variant: 'outline',
+          children: 'Retry'
+        })
       })
     })
   }
@@ -1018,7 +1047,7 @@ function DriveSettings({ ctx }) {
           jsx('span', {
             className: 'text-(--ui-text-secondary)',
             children: statusQ.data
-              ? `Connected as ${statusQ.data.account || 'unknown'}${
+              ? `Connected as ${statusQ.data.account || 'unknown'}${statusQ.data.credential ? ` · ${statusQ.data.credential} credential` : ''}${
                   quota.limit ? ` · ${humanSize(quota.usage)} of ${humanSize(quota.limit)} used` : ''
                 }`
               : statusQ.isLoading
